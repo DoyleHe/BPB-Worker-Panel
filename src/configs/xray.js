@@ -1,8 +1,9 @@
-import { getConfigAddresses, extractWireguardParams, base64ToDecimal, generateRemark, randomUpperCase, getRandomPath, resolveDNS, isDomain, getDomain } from './helpers';
-import { getDataset } from '../kv/handlers';
+import { getConfigAddresses, extractWireguardParams, base64ToDecimal, generateRemark, randomUpperCase, resolveDNS, isDomain, getDomain, generateWsPath } from '#configs/utils';
+import { getDataset } from '#kv';
+import { globalConfig, httpConfig } from '#common/init';
+import { settings } from '#common/handlers'
 
 async function buildXrayDNS(outboundAddrs, domainToStaticIPs, isWorkerLess, isWarp, customDns, customDnsHosts) {
-    const settings = globalThis.settings;
     function buildDnsServer(address, domains, expectIPs, skipFallback, tag) {
         return {
             address,
@@ -30,10 +31,8 @@ async function buildXrayDNS(outboundAddrs, domainToStaticIPs, isWorkerLess, isWa
         dnsHost[domain] = ["127.0.0.1"];
     });
 
-    const staticIPs = domainToStaticIPs ? await resolveDNS(domainToStaticIPs) : undefined;
-    if (staticIPs) dnsHost[domainToStaticIPs] = settings.VLTRenableIPv6
-        ? [...staticIPs.ipv4, ...staticIPs.ipv6]
-        : staticIPs.ipv4;
+    const staticIPs = domainToStaticIPs ? await resolveDNS(domainToStaticIPs, !settings.VLTRenableIPv6) : undefined;
+    if (staticIPs) dnsHost[domainToStaticIPs] = [...staticIPs.ipv4, ...staticIPs.ipv6];
 
     const hosts = Object.keys(dnsHost).length ? { hosts: dnsHost } : {};
     const isIPv6 = (settings.VLTRenableIPv6 && !isWarp) || (settings.warpEnableIPv6 && isWarp);
@@ -52,7 +51,7 @@ async function buildXrayDNS(outboundAddrs, domainToStaticIPs, isWorkerLess, isWa
         finalRemoteDNS = `https://${customDns}/dns-query`;
         dnsObject.hosts[customDns] = customDnsHosts;
         skipFallback = false;
-        dnsObject.disableFallback = true;
+        dnsObject.disableFallbackIfMatch = true;
     }
 
     const remoteDnsServer = buildDnsServer(finalRemoteDNS, null, null, null, "remote-dns");
@@ -88,7 +87,7 @@ async function buildXrayDNS(outboundAddrs, domainToStaticIPs, isWorkerLess, isWa
             if (!groupedDomainRules.has(dns)) groupedDomainRules.set(dns, []);
             groupedDomainRules.get(dns).push(domain)
         }
-        
+
         if (domain) totalDomainRules.push(domain);
     });
 
@@ -111,8 +110,15 @@ async function buildXrayDNS(outboundAddrs, domainToStaticIPs, isWorkerLess, isWa
 }
 
 function buildXrayRoutingRules(isChain, isBalancer, isWorkerLess, isWarp) {
-    const settings = globalThis.settings;
     const rules = [
+        {
+            inboundTag: [
+                "socks-in"
+            ],
+            port: 53,
+            outboundTag: "dns-out",
+            type: "field"
+        },
         {
             inboundTag: [
                 "dns-in"
@@ -138,7 +144,7 @@ function buildXrayRoutingRules(isChain, isBalancer, isWorkerLess, isWarp) {
 
     const finallOutboundTag = isChain ? "chain" : isWorkerLess ? "fragment" : "proxy";
     const outTag = isBalancer ? "all" : finallOutboundTag;
-    // const remoteDnsServers = isWorkerLess ? ["remote-dns", "remote-dns-fallback"] : ["remote-dns"];
+
     addRoutingRule(["remote-dns"], null, null, null, null, outTag, isBalancer);
     addRoutingRule(["dns"], null, null, null, null, "direct");
 
@@ -198,12 +204,11 @@ function buildXrayRoutingRules(isChain, isBalancer, isWorkerLess, isWarp) {
     return rules;
 }
 
-function buildXrayVLOutbound(tag, address, port, host, sni, proxyIPs, isFragment, allowInsecure) {
-    const settings = globalThis.settings;
-    const proxyIpPath = proxyIPs.length ? `/${btoa(proxyIPs.join(','))}` : '';
-    const path = `/${getRandomPath(16)}${proxyIpPath}?ed=2560`;
+function buildXrayVLOutbound(tag, address, port, host, sni, isFragment, allowInsecure) {
+    const path = `${generateWsPath("vl")}?ed=2560`;
+
     const outbound = {
-        protocol: 'vless',
+        protocol: atob('dmxlc3M='),
         settings: {
             vnext: [
                 {
@@ -211,7 +216,7 @@ function buildXrayVLOutbound(tag, address, port, host, sni, proxyIPs, isFragment
                     port: port,
                     users: [
                         {
-                            id: globalThis.userID,
+                            id: globalConfig.userID,
                             encryption: "none",
                             level: 8
                         }
@@ -222,20 +227,22 @@ function buildXrayVLOutbound(tag, address, port, host, sni, proxyIPs, isFragment
         streamSettings: {
             network: "ws",
             security: "none",
-            sockopt: {},
+            sockopt: {
+                tcpFastOpen: true
+            },
             wsSettings: {
                 host: host,
-                path: path
+                path,
             }
         },
         tag: tag
     };
 
-    if (globalThis.defaultHttpsPorts.includes(port)) {
+    if (httpConfig.defaultHttpsPorts.includes(port)) {
         outbound.streamSettings.security = "tls";
         outbound.streamSettings.tlsSettings = {
             allowInsecure: allowInsecure,
-            fingerprint: "randomized",
+            fingerprint: settings.fingerprint,
             alpn: ["http/1.1"],
             serverName: sni
         };
@@ -251,18 +258,17 @@ function buildXrayVLOutbound(tag, address, port, host, sni, proxyIPs, isFragment
     return outbound;
 }
 
-function buildXrayTROutbound(tag, address, port, host, sni, proxyIPs, isFragment, allowInsecure) {
-    const settings = globalThis.settings;
-    const proxyIpPath = proxyIPs.length ? `/${btoa(proxyIPs.join(','))}` : '';
-    const path = `/tr${getRandomPath(16)}${proxyIpPath}?ed=2560`;
+function buildXrayTROutbound(tag, address, port, host, sni, isFragment, allowInsecure) {
+    const path = `${generateWsPath("tr")}?ed=2560`;
+
     const outbound = {
-        protocol: "trojan",
+        protocol: atob('dHJvamFu'),
         settings: {
             servers: [
                 {
                     address: address,
                     port: port,
-                    password: globalThis.TRPassword,
+                    password: globalConfig.TrPass,
                     level: 8
                 }
             ]
@@ -270,20 +276,22 @@ function buildXrayTROutbound(tag, address, port, host, sni, proxyIPs, isFragment
         streamSettings: {
             network: "ws",
             security: "none",
-            sockopt: {},
+            sockopt: {
+                tcpFastOpen: true
+            },
             wsSettings: {
                 host: host,
-                path: path
+                path
             }
         },
         tag: tag
     };
 
-    if (globalThis.defaultHttpsPorts.includes(port)) {
+    if (httpConfig.defaultHttpsPorts.includes(port)) {
         outbound.streamSettings.security = "tls";
         outbound.streamSettings.tlsSettings = {
             allowInsecure: allowInsecure,
-            fingerprint: "randomized",
+            fingerprint: settings.fingerprint,
             alpn: ["http/1.1"],
             serverName: sni
         };
@@ -300,7 +308,6 @@ function buildXrayTROutbound(tag, address, port, host, sni, proxyIPs, isFragment
 }
 
 function buildXrayWarpOutbound(warpConfigs, endpoint, isWoW) {
-    const settings = globalThis.settings;
     const {
         warpIPv6,
         reserved,
@@ -331,7 +338,7 @@ function buildXrayWarpOutbound(warpConfigs, endpoint, isWoW) {
 
     let chain = '';
     if (isWoW) chain = "proxy";
-    if (!isWoW && globalThis.client === 'xray-pro') chain = "udp-noise";
+    if (!isWoW && httpConfig.client === 'xray') chain = "udp-noise";
 
     if (chain) outbound.streamSettings = {
         sockopt: {
@@ -339,7 +346,7 @@ function buildXrayWarpOutbound(warpConfigs, endpoint, isWoW) {
         }
     };
 
-    if (globalThis.client === 'xray-knocker' && !isWoW) {
+    if (httpConfig.client === 'xray-knocker' && !isWoW) {
         delete outbound.streamSettings;
         Object.assign(outbound.settings, {
             wnoise: settings.knockerNoiseMode,
@@ -358,9 +365,12 @@ function buildXrayWarpOutbound(warpConfigs, endpoint, isWoW) {
     return outbound;
 }
 
-function buildXrayChainOutbound(chainProxyParams, VLTRenableIPv6) {
-    if (['socks', 'http'].includes(chainProxyParams.protocol)) {
-        const { protocol, server, port, user, pass } = chainProxyParams;
+function buildXrayChainOutbound() {
+    const { outProxyParams, VLTRenableIPv6 } = settings;
+    const { protocol } = outProxyParams;
+
+    if (['socks', 'http'].includes(protocol)) {
+        const { server, port, user, pass } = outProxyParams;
         return {
             protocol: protocol,
             settings: {
@@ -398,7 +408,7 @@ function buildXrayChainOutbound(chainProxyParams, VLTRenableIPv6) {
     const {
         server, port, uuid, flow, security, type, sni, fp, alpn, pbk,
         sid, spx, headerType, host, path, authority, serviceName, mode
-    } = chainProxyParams;
+    } = outProxyParams;
 
     const proxyOutbound = {
         mux: {
@@ -407,7 +417,7 @@ function buildXrayChainOutbound(chainProxyParams, VLTRenableIPv6) {
             xudpConcurrency: 16,
             xudpProxyUDP443: "reject"
         },
-        protocol: "vless",
+        protocol: atob('dmxlc3M='),
         settings: {
             vnext: [
                 {
@@ -503,7 +513,6 @@ function buildXrayChainOutbound(chainProxyParams, VLTRenableIPv6) {
 }
 
 function buildFreedomOutbound(isFragment, isUdpNoises, tag, length, interval) {
-    const settings = globalThis.settings;
     const outbound = {
         tag: tag,
         protocol: "freedom",
@@ -547,7 +556,6 @@ async function buildXrayConfig(
     customDns,
     customDnsHosts
 ) {
-    const settings = globalThis.settings;
     const config = structuredClone(xrayConfigTemp);
     config.remarks = remark;
 
@@ -560,7 +568,7 @@ async function buildXrayConfig(
         config.outbounds.unshift(fragmentOutbound);
     }
 
-    if (isWarp && globalThis.client === 'xray-pro') {
+    if (isWarp && httpConfig.client === 'xray') {
         const udpNoiseOutbound = buildFreedomOutbound(false, true, 'udp-noise');
         config.outbounds.unshift(udpNoiseOutbound);
     }
@@ -597,19 +605,18 @@ async function buildXrayConfig(
 }
 
 async function buildXrayBestPingConfig(totalAddresses, chainProxy, outbounds, isFragment) {
-    const remark = isFragment ? `💦 BPB F - Best Ping 💥` : `💦 BPB - Best Ping 💥`;
+    const remark = isFragment ? `💦 ${atob('QlBC')} F - Best Ping 💥` : `💦 ${atob('QlBC')} - Best Ping 💥`;
     const config = await buildXrayConfig(remark, true, chainProxy, true, false, isFragment, false, totalAddresses, null);
     config.outbounds.unshift(...outbounds);
     return config;
 }
 
-async function buildXrayBestFragmentConfig(hostName, chainProxy, outbound) {
-    const settings = globalThis.settings;
+async function buildXrayBestFragmentConfig(chainProxy, outbound) {
     const bestFragValues = ['10-20', '20-30', '30-40', '40-50', '50-60', '60-70',
         '70-80', '80-90', '90-100', '10-30', '20-40', '30-50',
         '40-60', '50-70', '60-80', '70-90', '80-100', '100-200'];
 
-    const config = await buildXrayConfig(`💦 BPB F - Best Fragment 😎`, true, chainProxy, false, false, true, false, [], hostName);
+    const config = await buildXrayConfig(`💦 ${atob('QlBC')} F - Best Fragment 😎`, true, chainProxy, false, false, true, false, [], httpConfig.hostName);
     const bestFragOutbounds = [];
 
     bestFragValues.forEach((fragLength, index) => {
@@ -634,17 +641,16 @@ async function buildXrayBestFragmentConfig(hostName, chainProxy, outbound) {
 }
 
 async function buildXrayWorkerLessConfig() {
-    const cfDnsConfig = await buildXrayConfig(`💦 BPB F - WorkerLess - 1 ⭐`, false, false, false, false, true, true, [], false, "cloudflare-dns.com", ["cloudflare.com"]);
-    const googleDnsConfig = await buildXrayConfig(`💦 BPB F - WorkerLess - 2 ⭐`, false, false, false, false, true, true, [], false, "dns.google", ["8.8.8.8", "8.8.4.4"]);
+    const cfDnsConfig = await buildXrayConfig(`💦 ${atob('QlBC')} F - WorkerLess - 1 ⭐`, false, false, false, false, true, true, [], false, "cloudflare-dns.com", ["cloudflare.com"]);
+    const googleDnsConfig = await buildXrayConfig(`💦 ${atob('QlBC')} F - WorkerLess - 2 ⭐`, false, false, false, false, true, true, [], false, "dns.google", ["8.8.8.8", "8.8.4.4"]);
     return [cfDnsConfig, googleDnsConfig];
 }
 
 export async function getXrayCustomConfigs(env, isFragment) {
-    const settings = globalThis.settings;
     let chainProxy;
     if (settings.outProxy) {
         try {
-            chainProxy = buildXrayChainOutbound(settings.outProxyParams, settings.VLTRenableIPv6);
+            chainProxy = buildXrayChainOutbound();
         } catch (error) {
             console.log('An error occured while parsing chain proxy: ', error);
             chainProxy = undefined;
@@ -658,11 +664,11 @@ export async function getXrayCustomConfigs(env, isFragment) {
     }
 
     const Addresses = await getConfigAddresses(settings.cleanIPs, settings.VLTRenableIPv6, settings.customCdnAddrs, isFragment);
-    const totalPorts = settings.ports.filter(port => isFragment ? globalThis.defaultHttpsPorts.includes(port) : true);
+    const totalPorts = settings.ports.filter(port => isFragment ? httpConfig.defaultHttpsPorts.includes(port) : true);
 
     let protocols = [];
-    if (settings.VLConfigs) protocols.push('VLESS');
-    if (settings.TRConfigs) protocols.push('Trojan');
+    if (settings.VLConfigs) protocols.push(atob('VkxFU1M='));
+    if (settings.TRConfigs) protocols.push(atob('VHJvamFu'));
 
     let configs = [];
     let outbounds = {
@@ -676,14 +682,14 @@ export async function getXrayCustomConfigs(env, isFragment) {
             for (const addr of Addresses) {
                 const isCustomAddr = settings.customCdnAddrs.includes(addr) && !isFragment;
                 const configType = isCustomAddr ? 'C' : isFragment ? 'F' : '';
-                const sni = isCustomAddr ? settings.customCdnSni : randomUpperCase(globalThis.hostName);
-                const host = isCustomAddr ? settings.customCdnHost : globalThis.hostName;
+                const sni = isCustomAddr ? settings.customCdnSni : randomUpperCase(httpConfig.hostName);
+                const host = isCustomAddr ? settings.customCdnHost : httpConfig.hostName;
                 const remark = generateRemark(protocolIndex, port, addr, settings.cleanIPs, protocol, configType);
                 const customConfig = await buildXrayConfig(remark, false, chainProxy, false, false, isFragment, false, [addr], null);
 
-                const outbound = protocol === 'VLESS'
-                    ? buildXrayVLOutbound('proxy', addr, port, host, sni, settings.proxyIPs, isFragment, isCustomAddr)
-                    : buildXrayTROutbound('proxy', addr, port, host, sni, settings.proxyIPs, isFragment, isCustomAddr);
+                const outbound = protocol === atob('VkxFU1M=')
+                    ? buildXrayVLOutbound('proxy', addr, port, host, sni, isFragment, isCustomAddr)
+                    : buildXrayTROutbound('proxy', addr, port, host, sni, isFragment, isCustomAddr);
 
                 customConfig.outbounds.unshift({ ...outbound });
                 outbounds.proxies.push(outbound);
@@ -710,7 +716,7 @@ export async function getXrayCustomConfigs(env, isFragment) {
     const bestPing = await buildXrayBestPingConfig(Addresses, chainProxy, totalOutbounds, isFragment);
     const finalConfigs = [...configs, bestPing];
     if (isFragment) {
-        const bestFragment = await buildXrayBestFragmentConfig(globalThis.hostName, chainProxy, outbounds.proxies[0]);
+        const bestFragment = await buildXrayBestFragmentConfig(chainProxy, outbounds.proxies[0]);
         const workerLessConfigs = await buildXrayWorkerLessConfig();
         finalConfigs.push(bestFragment, ...workerLessConfigs);
     }
@@ -726,7 +732,6 @@ export async function getXrayCustomConfigs(env, isFragment) {
 }
 
 export async function getXrayWarpConfigs(request, env, isPro) {
-    const settings = globalThis.settings;
     const { warpConfigs } = await getDataset(request, env);
     const proIndicator = isPro ? ' Pro ' : ' ';
     const xrayWarpConfigs = [];
@@ -859,7 +864,6 @@ const xrayConfigTemp = {
 };
 
 function getRoutingRules() {
-    const settings = globalThis.settings;
     return [
         { rule: settings.blockAds, type: 'block', domain: "geosite:category-ads-all" },
         { rule: settings.blockAds, type: 'block', domain: "geosite:category-ads-ir" },

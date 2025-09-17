@@ -75,6 +75,10 @@ h1 {
     gap: var(--container-gap);
 }
 
+.container > .section{
+    margin: 0;
+}
+
 .inner-container {
     display: flex;
     flex-direction: column;
@@ -306,6 +310,10 @@ button.panel-settings {
         'opsz' 24
 }
 
+a .material-symbols-rounded {
+    color: var(--secondary-color);
+}
+
 details:not(:last-of-type) {
     border-bottom: 1px solid var(--border-color);
 }
@@ -333,6 +341,10 @@ h3 {
     color: var(--hr-text-color);
     justify-content: center;
     align-items: center;
+}
+
+h4 {
+    margin: 0;
 }
 
 hr {
